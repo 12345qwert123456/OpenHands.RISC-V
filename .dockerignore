@@ -1,0 +1,6 @@
+# The Dockerfile only needs docker-entrypoint.sh from the build context; the
+# rest of the build inputs come from PyPI and from the official AMD64 image.
+# Keeping the context minimal avoids sending the working directory to the
+# daemon on every build.
+*
+!docker-entrypoint.sh

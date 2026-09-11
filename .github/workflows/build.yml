@@ -1,0 +1,172 @@
+name: Build OpenHands Agent Canvas for RISC-V 64
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # daily at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if the release already exists'
+        type: boolean
+        default: false
+      version:
+        description: 'OpenHands release tag to build (e.g. v1.16.0). Empty = latest.'
+        type: string
+        default: ''
+
+env:
+  IMAGE_NAME: openhands-riscv64
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_USERNAME }}/openhands-riscv64
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      canvas: ${{ steps.resolve.outputs.canvas }}
+      agent_server: ${{ steps.resolve.outputs.agent_server }}
+      automation: ${{ steps.resolve.outputs.automation }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG=$(curl -sL https://api.github.com/repos/OpenHands/OpenHands/releases/latest | jq -r '.tag_name')
+          fi
+
+          # config/defaults.json at that tag is upstream's single source of
+          # truth for the three interdependent versions — the frontend bundle,
+          # the agent-server REST API and the automation backend all have to
+          # come from the same release.
+          DEFAULTS=$(curl -sfL "https://raw.githubusercontent.com/OpenHands/OpenHands/${TAG}/config/defaults.json")
+          CANVAS=$(echo "$DEFAULTS"       | jq -r '.versions.agentCanvas')
+          AGENT_SERVER=$(echo "$DEFAULTS" | jq -r '.versions.agentServer')
+          AUTOMATION=$(echo "$DEFAULTS"   | jq -r '.versions.automation')
+
+          echo "tag=${TAG}"                     >> "$GITHUB_OUTPUT"
+          echo "canvas=${CANVAS}"               >> "$GITHUB_OUTPUT"
+          echo "agent_server=${AGENT_SERVER}"   >> "$GITHUB_OUTPUT"
+          echo "automation=${AUTOMATION}"       >> "$GITHUB_OUTPUT"
+          echo "Resolved: ${TAG} -> canvas ${CANVAS}, agent-server ${AGENT_SERVER}, automation ${AUTOMATION}"
+
+      - name: Check if already built
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.resolve.outputs.tag }}"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+          EXISTING=$(gh release view "${TAG}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --json tagName -q '.tagName' 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG}-riscv64 already exists, skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release for ${TAG}-riscv64, will build"
+          fi
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    # 360 min is the GitHub-hosted ceiling. The riscv64 build is emulated and
+    # `grpcio` alone is a multi-hour compile, so a cold run can hit this limit.
+    # cache-to: gha,mode=max means the next scheduled run resumes from what did
+    # finish. For a reliable one-shot build, register a riscv64 self-hosted
+    # runner (an OrangePi RV2 works) and change `runs-on` below.
+    timeout-minutes: 360
+    env:
+      CANVAS: ${{ needs.detect.outputs.canvas }}
+      TAG: ${{ needs.detect.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/riscv64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.CANVAS }}
+          build-args: |
+            AGENT_CANVAS_TAG=${{ needs.detect.outputs.canvas }}
+            AGENT_SERVER_VERSION=${{ needs.detect.outputs.agent_server }}
+            AUTOMATION_VERSION=${{ needs.detect.outputs.automation }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.CANVAS }}"
+          # Architecture
+          docker inspect "$IMG" --format '{{.Architecture}}' | grep -qx 'riscv64' \
+            || { echo "ERROR: image is not riscv64"; exit 1; }
+          # The whole Python stack imports against the runtime image's libs
+          # (--entrypoint bypasses the service-launcher entrypoint)
+          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" \
+            -c "import openhands.agent_server, openhands.tools, openhands.workspace, openhands.automation.app; print('imports ok')"
+          # Frontend + Node made it in
+          docker run --rm --platform linux/riscv64 --entrypoint sh "$IMG" -c \
+            "node --version && test -f /opt/agent-canvas/frontend/index.html && echo 'frontend ok'"
+
+      - name: Login to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to Docker Hub
+        if: vars.DOCKERHUB_USERNAME != ''
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ env.CANVAS }}"
+          docker tag "$IMG" "${{ env.DOCKERHUB_REPO }}:${{ env.CANVAS }}"
+          docker tag "$IMG" "${{ env.DOCKERHUB_REPO }}:latest"
+          docker push "${{ env.DOCKERHUB_REPO }}:${{ env.CANVAS }}"
+          docker push "${{ env.DOCKERHUB_REPO }}:latest"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ env.TAG }}-riscv64" \
+            --repo "${{ github.repository }}" \
+            --title "OpenHands Agent Canvas ${{ env.CANVAS }} for RISC-V 64" \
+            --notes "Unofficial \`linux/riscv64\` build of [OpenHands Agent Canvas ${{ env.TAG }}](https://github.com/OpenHands/OpenHands/releases/tag/${{ env.TAG }}).
+
+          Pinned from upstream \`config/defaults.json\`:
+
+          | Component | Version |
+          |---|---|
+          | agent-canvas (frontend) | ${{ needs.detect.outputs.canvas }} |
+          | agent-server | ${{ needs.detect.outputs.agent_server }} |
+          | automation | ${{ needs.detect.outputs.automation }} |
+
+          **Docker image:**
+          \`\`\`bash
+          docker pull ${{ env.DOCKERHUB_REPO }}:${{ needs.detect.outputs.canvas }}
+          \`\`\`
+
+          See the [README](https://github.com/${{ github.repository }}#readme) for run instructions and known limitations (no VSCode Web, no browser tool on riscv64)." || \
+          gh release edit "${{ env.TAG }}-riscv64" --repo "${{ github.repository }}" --draft=false

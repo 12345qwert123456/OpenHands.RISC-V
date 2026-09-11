@@ -1,0 +1,22 @@
+# Local build artifacts / logs
+*.log
+buildlog.txt
+build/
+dist/
+
+# Local data dirs from `docker run -v ./...`
+openhands-data/
+projects/
+data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local Claude Code config (permissions etc.) — not part of the published project
+.claude/
+
+# Private GitOps clone (separate repo, own remote) — not part of this public build repo
+openhands/

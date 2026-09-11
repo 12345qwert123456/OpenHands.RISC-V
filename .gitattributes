@@ -1,0 +1,5 @@
+# Shell scripts must stay LF or they break as a container entrypoint
+# ("bad interpreter: /bin/sh^M").
+*.sh   text eol=lf
+Dockerfile text eol=lf
+*.yml  text eol=lf
