@@ -134,12 +134,17 @@ jobs:
             "node --version && test -f /opt/agent-canvas/frontend/index.html && echo 'frontend ok'"
           # Versions actually installed, so a RISE lag behind PyPI shows up in
           # the log instead of silently going unnoticed, and confirmation that
-          # cryptography and Pillow really compiled from source rather than a
-          # manylinux wheel: those wheels bundle their own copies of OpenSSL /
-          # libjpeg / libwebp / etc. in a "*.libs" directory (the auditwheel
-          # convention), which a plain sdist build against Debian's own
-          # libraries never creates.
-          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" -c 'import importlib.metadata as m, pathlib, sysconfig; [print(f"{p}=={m.version(p)}") for p in ["grpcio","litellm","cryptography","pillow","orjson","lmnr-claude-code-proxy"]]; b=sorted(x.name for x in pathlib.Path(sysconfig.get_path("purelib")).glob("*.libs")); assert not b, f"found bundled-library directories: {b}"; print("no bundled *.libs directories")'
+          # Pillow really compiled from source rather than a manylinux wheel:
+          # such a wheel bundles its own copies of libjpeg / libwebp / etc. in
+          # a "pillow.libs" directory (the auditwheel convention), which a
+          # plain sdist build against Debian's own libraries never creates.
+          # This is scoped to Pillow specifically, not "no *.libs anywhere" -
+          # other RISE wheels (e.g. google-crc32c) legitimately bundle their
+          # own small, non-Debian-patched native code the same way, and that
+          # is fine; only Pillow and cryptography (checked separately below,
+          # by actual linkage rather than directory layout) are required to
+          # build against Debian's own libraries.
+          docker run --rm --platform linux/riscv64 --entrypoint python "$IMG" -c 'import importlib.metadata as m, pathlib, sysconfig; [print(f"{p}=={m.version(p)}") for p in ["grpcio","litellm","cryptography","pillow","orjson","lmnr-claude-code-proxy"]]; b=sorted(x.name for x in pathlib.Path(sysconfig.get_path("purelib")).glob("*illow.libs")); assert not b, f"found bundled-library directories: {b}"; print("no bundled Pillow *.libs directory")'
           # cryptography's compiled extension must resolve libssl/libcrypto to
           # Debian's own shared objects, confirming it is not linked against a
           # private copy.
