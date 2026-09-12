@@ -53,11 +53,22 @@ original entrypoint be reused unmodified.
 
 PyPI's riscv64 wheel coverage has grown a lot (`tokenizers`, `pydantic-core`, `jiter`,
 `rpds-py`, `lxml`, `blake3`, `aiohttp`, `websockets` all resolve to `manylinux_*_riscv64`
-wheels), but it is still partial. `grpcio`, `cryptography`, `orjson`, `tiktoken`, `uvloop`,
-`asyncpg`, `pillow`, `httptools`, `fastuuid` and a few more are compiled from source.
-Debian's rustc 1.85 is too old for some of them (`orjson` wants 1.95, `litellm`'s Rust
-bridge 1.94, `tiktoken` 1.87), so the stage installs a current stable via rustup —
-`riscv64gc-unknown-linux-gnu` is a Tier-2 target with host tools.
+wheels), but it is still partial, and compiling everything else under QEMU does not fit in
+GitHub's 6-hour job limit — `grpcio` alone took **4 h 22 min** in a from-source run. So
+`grpcio`, `orjson`, `tiktoken`, `uvloop`, `asyncpg`, `httptools`, `fastuuid` and the rest come
+from the [RISE project](https://riseproject.gitlab.io/python/wheel_builder/)'s riscv64 wheel
+index instead (`PIP_EXTRA_INDEX_URL` + `PIP_PREFER_BINARY=1`) — pre-built, tested, sometimes a
+release or so behind PyPI, but never older than what upstream's own official image ships.
+`cryptography` and Pillow are the exception (`PIP_NO_BINARY`): both are always compiled here
+against Debian's own OpenSSL and image libraries, because their manylinux wheels bundle
+private copies of those C libraries that Debian's security updates never reach. A
+[`security-floor.py`](security-floor.py) pass then audits the whole venv with `pip-audit` and
+force-upgrades anything with a known, already-released fix — from RISE if it has the newer
+wheel, compiled otherwise — so the version lag this trades for build time can never ship a
+vulnerability that a plain PyPI build would already have fixed. Debian's rustc 1.85 is too old
+for some of these builds (`orjson` wants 1.95, `litellm`'s Rust bridge 1.94, `tiktoken` 1.87),
+so the stage installs a current stable via rustup — `riscv64gc-unknown-linux-gnu` is a Tier-2
+target with host tools.
 
 ### Stage 2 — Frontend source (AMD64, zero RUN commands)
 
@@ -92,12 +103,32 @@ without executing anything, either way.
 docker build -t openhands-riscv64 .
 ```
 
-> **Budget most of a day for the first build.** A measured run on an OrangePi RV2 spent
-> **~6 hours** in stage 1, and `grpcio` alone — a large C++ build with no riscv64 wheel —
-> accounted for about 4 of them; `cryptography`, `fastuuid`, `uvloop`, `asyncpg` and `pillow`
-> are the next slowest. The board's cores are the limit. A BuildKit cache is mounted for
-> pip's wheel cache, so an interrupted or failed build resumes near where it stopped — re-run
-> the same command.
+> **Stage 1 should no longer take hours.** Most of the native dependency tree now comes
+> pre-built from the [RISE riscv64 wheel index](https://riseproject.gitlab.io/python/wheel_builder/)
+> (see [Why not upstream](#why-not-upstream) / Stage 1 above); `cryptography` and Pillow still
+> compile from source, but both are quick. Expect the board's network link and the
+> `security-floor.py` audit pass to matter more than compilation now. A from-source build of
+> everything (`--build-arg PIP_EXTRA_INDEX_URL= --build-arg PIP_PREFER_BINARY=0`, below) is a
+> different story: a measured run on an OrangePi RV2 spent **~6 hours** in stage 1 before this
+> change, with `grpcio` alone accounting for about 4 of them. A BuildKit cache is mounted for
+> pip's wheel cache either way, so an interrupted or failed build resumes near where it
+> stopped — re-run the same command.
+
+### Building fully from source
+
+To skip the RISE wheel index entirely and compile every native dependency from PyPI's
+sources, as the image did before it started using RISE — for auditing, for a version RISE has
+not published yet, or simply to not depend on a third-party wheel index:
+
+```bash
+docker build \
+  --build-arg PIP_EXTRA_INDEX_URL= \
+  --build-arg PIP_PREFER_BINARY=0 \
+  -t openhands-riscv64 .
+```
+
+`security-floor.py` still runs — pip-audit needs no wheel index to check installed versions
+against known vulnerabilities.
 
 ### Cross-building from x86-64 with QEMU
 
@@ -107,9 +138,12 @@ docker buildx create --name riscv --driver docker-container --use
 docker buildx build --platform linux/riscv64 --load -t openhands-riscv64 .
 ```
 
-Slower than the native build, not faster — emulated compilation of the C and Rust extensions
-is the bottleneck. Add `--progress=plain` to watch it; `--target python_builder` builds only
-the compile-heavy stage.
+With the RISE wheel index (the default), this is now the more convenient way to build even on
+a beefy x86-64 machine — QEMU only has to emulate `cryptography`/Pillow's compiles and
+whatever a package resolves without a wheel. Building fully from source under QEMU is a
+different story: emulated compilation of the C and Rust extensions is a real bottleneck there,
+and it does not beat a native build. Add `--progress=plain` to watch it; `--target
+python_builder` builds only stage 1.
 
 ### Memory and disk
 
@@ -209,7 +243,9 @@ is passed straight through.
   Debian's `docker.io` if you need it.
 - **The frontend comes from the AMD64 image**, pinned by `AGENT_CANVAS_TAG`, and must match
   `AGENT_SERVER_VERSION` / `AUTOMATION_VERSION` from the same upstream release.
-- **The first build is long** — everything without a riscv64 wheel is compiled from source.
+- **A from-source build is long.** With the default RISE wheel index this is no longer true of
+  a normal build; opting out of it (`PIP_PREFER_BINARY=0`, see [Build](#build)) compiles
+  everything without a riscv64 wheel on PyPI, which is genuinely slow.
 
 ## Why not upstream?
 
@@ -240,15 +276,22 @@ The workflow (`.github/workflows/build.yml`):
   `config/defaults.json` at that tag
 - skips if a `<tag>-riscv64` GitHub Release already exists
 - builds the `linux/riscv64` image under QEMU with GitHub Actions layer cache
-- smoke-tests it (riscv64 arch, the full Python stack imports, frontend + Node present)
+- smoke-tests it (riscv64 arch, the full Python stack imports, frontend + Node present,
+  installed versions, no manylinux-bundled `*.libs` directories, `cryptography` linked
+  against Debian's own `libssl`/`libcrypto`)
 - pushes to Docker Hub and creates a GitHub Release
 
 Trigger a specific version or a forced rebuild via **workflow_dispatch**.
 
-> The emulated build is heavy — `grpcio` alone is a multi-hour compile — and a cold run can
-> hit the 6-hour GitHub-hosted job limit. `cache-to: gha,mode=max` lets the next scheduled
-> run resume; for a reliable one-shot build, register a riscv64 self-hosted runner (an
-> OrangePi RV2 works) and point `runs-on` at it.
+> A fully-emulated from-source build is heavy enough — `grpcio` alone is a multi-hour compile
+> — to blow through the 6-hour GitHub-hosted job limit on a cold run, which is why the
+> Dockerfile takes most of the native dependency tree from the
+> [RISE riscv64 wheel index](https://riseproject.gitlab.io/python/wheel_builder/) instead (see
+> Stage 1 above); a normal run should finish in roughly an hour to an hour and a half. Note
+> that `cache-to: gha,mode=max` only helps a *subsequent* build: it is exported after the
+> build step finishes, so a run that hits the timeout leaves nothing behind for the next one.
+> If RISE ever lags behind by enough to force widespread source fallback, register a riscv64
+> self-hosted runner (an OrangePi RV2 works) and point `runs-on` at it.
 
 ### Required repository settings
 

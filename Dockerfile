@@ -66,10 +66,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #
 # PyPI gained riscv64 wheel support in 2025 and coverage is growing (tokenizers,
 # pydantic-core, jiter, rpds-py, lxml, blake3, aiohttp all resolve to
-# manylinux_*_riscv64 wheels already), but it is still partial. What is missing
-# — grpcio, tiktoken, orjson, uvloop, httptools, asyncpg, cryptography, Pillow,
-# fastuuid, tree-sitter-bash, … — is compiled from source below, so the C
-# toolchain and the -dev headers those builds need are installed up front.
+# manylinux_*_riscv64 wheels already), but it is still partial. What is
+# missing — grpcio, tiktoken, orjson, uvloop, httptools, asyncpg, cryptography,
+# Pillow, fastuuid, tree-sitter-bash, … — comes from the RISE riscv64 wheel
+# index instead (see the PIP_EXTRA_INDEX_URL note below); cryptography and
+# Pillow are compiled from source regardless, and anything neither PyPI nor
+# RISE has a wheel for falls back to source too. Either way the C toolchain
+# and the -dev headers those builds need are installed up front.
 #
 # The apt hardening below is not incidental. This stage pulls a full toolchain
 # over a link that, behind a proxy or a distant mirror, drops connections under
@@ -120,8 +123,58 @@ ENV PATH=${VIRTUAL_ENV}/bin:${PATH}
 RUN python3 -m venv ${VIRTUAL_ENV} && \
     pip install --upgrade pip setuptools wheel
 
+# Where the compiled half of the dependency tree comes from.
+#
+# PyPI has no riscv64 wheel for grpcio, litellm, cryptography, orjson,
+# tiktoken, lmnr-claude-code-proxy, uvloop, asyncpg, Pillow and several more,
+# and compiling all of them under QEMU does not fit in GitHub's 6-hour job
+# limit (grpcio alone took 4 h 22 min). The RISE project (RISC-V Software
+# Ecosystem, Linux Foundation Europe) builds, tests and publishes riscv64
+# wheels for them: https://riseproject.gitlab.io/python/wheel_builder/
+#
+# PIP_PREFER_BINARY makes pip take the newest pre-built wheel that satisfies
+# the requirements even when PyPI already has a newer sdist, so a package RISE
+# has not caught up on yet arrives a release or so behind PyPI instead of
+# costing hours of compilation. pip still only picks versions upstream's
+# requirements allow, and the security floor below keeps the lag from ever
+# including a known, already fixed vulnerability.
+#
+# PIP_NO_BINARY is the exception: cryptography and Pillow are always compiled
+# here, against Debian's OpenSSL and image libraries. Their manylinux wheels
+# carry private copies of those C libraries (checked September 2026: RISE's
+# cryptography 50.0.0 bundles OpenSSL 3.5.5 while trixie ships 3.5.7), which
+# Debian's security updates never reach and pip-audit cannot see. Both are
+# quick to build.
+#
+# These are pip's own environment variable names: an ARG is visible to RUN as
+# an environment variable, so pip reads them directly. For a build entirely
+# from PyPI sources, as before:
+#   --build-arg PIP_EXTRA_INDEX_URL= --build-arg PIP_PREFER_BINARY=0
+ARG PIP_EXTRA_INDEX_URL=https://gitlab.com/api/v4/projects/56254198/packages/pypi/simple
+ARG PIP_PREFER_BINARY=1
+ARG PIP_NO_BINARY=cryptography,pillow
+
+# Compiler settings for whatever is still built from source. -g0: Debian's
+# Python compiles extensions with -g, which made a from-source grpcio wheel
+# 160 MB of mostly debug info and slowed every compile and link under QEMU; -O2
+# is spelled out because autotools builds take CFLAGS verbatim. The Cargo
+# overrides switch off the fat-LTO, single-codegen-unit release profiles of
+# orjson, fastuuid and lmnr-claude-code-proxy, whose last step is one long
+# single-threaded compile. The GRPC_* switches build grpcio against Debian's
+# OpenSSL and zlib instead of its bundled BoringSSL, should it ever need
+# compiling here. Declared here rather than with the ENV at the top so that
+# changing them does not invalidate the apt and rustup layers.
+ENV CFLAGS="-O2 -g0" \
+    CXXFLAGS="-O2 -g0" \
+    CARGO_PROFILE_RELEASE_LTO=off \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 \
+    GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1
+
 # One resolver pass for the whole stack so the shared pins settle once
 # (openhands-automation pins openhands-sdk and openhands-workspace exactly).
+# The list goes through a file so the security floor below can re-resolve
+# exactly the same set.
 #
 # agent-client-protocol<0.11 mirrors constraints.agentClientProtocol in
 # upstream config/defaults.json: acp 0.11.0 reordered the arguments of
@@ -134,13 +187,31 @@ RUN python3 -m venv ${VIRTUAL_ENV} && \
 # is /opt/cargo (set above), so that is where the registry cache mounts.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/opt/cargo/registry \
-    pip install \
+    mkdir -p /opt/build && \
+    printf '%s\n' \
         "openhands-agent-server==${AGENT_SERVER_VERSION}" \
         "openhands-sdk[boto3]==${AGENT_SERVER_VERSION}" \
         "openhands-tools==${AGENT_SERVER_VERSION}" \
         "openhands-workspace==${AGENT_SERVER_VERSION}" \
         "openhands-automation==${AUTOMATION_VERSION}" \
-        "agent-client-protocol<0.11"
+        "agent-client-protocol<0.11" \
+        > /opt/build/requirements.txt && \
+    pip install -r /opt/build/requirements.txt
+
+# Security floor for PIP_PREFER_BINARY: pip-audit checks every installed
+# distribution against PyPI's advisory data, and anything with a released fix
+# is lifted to it — from RISE if it has the wheel, compiled from the sdist
+# otherwise. The build fails if the audit cannot run or an installable fix does
+# not install; a fix the stack's own version caps rule out (a plain PyPI build
+# could not install it either) is reported loudly instead. pip-audit lives in a
+# throwaway venv, so none of it reaches the image. Details in security-floor.py.
+COPY security-floor.py /opt/build/security-floor.py
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/opt/cargo/registry \
+    /usr/bin/python3 -m venv /tmp/audit && \
+    /tmp/audit/bin/pip install --quiet pip-audit && \
+    /tmp/audit/bin/python /opt/build/security-floor.py && \
+    rm -rf /tmp/audit
 
 # Import the four entry points the runtime actually starts, so a broken native
 # build fails the image build instead of the first `docker run`.

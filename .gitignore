@@ -15,6 +15,10 @@ data/
 .vscode/
 *.swp
 
+# Python (security-floor.py is imported locally when testing it)
+__pycache__/
+*.pyc
+
 # Local Claude Code config (permissions etc.) — not part of the published project
 .claude/
 
