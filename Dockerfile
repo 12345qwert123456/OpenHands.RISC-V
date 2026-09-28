@@ -176,10 +176,13 @@ ENV CFLAGS="-O2 -g0" \
 # The list goes through a file so the security floor below can re-resolve
 # exactly the same set.
 #
-# agent-client-protocol<0.11 mirrors constraints.agentClientProtocol in
-# upstream config/defaults.json: acp 0.11.0 reordered the arguments of
-# prompt() and breaks the SDK's ACP client with a PromptRequest validation
-# error.
+# agent-client-protocol is intentionally NOT pinned here: openhands-sdk
+# declares its own compatible range (config/defaults.json used to carry a
+# separate constraints.agentClientProtocol — acp 0.11.0 reordered the
+# arguments of prompt() and broke older SDK versions' ACP client with a
+# PromptRequest validation error — but upstream dropped that key once the SDK
+# itself moved to a fixed range; pinning it here ourselves just fights
+# whatever range the resolved openhands-sdk version actually declares).
 #
 # The cache mounts matter far more here than they would on amd64: a build that
 # fails halfway under QEMU is otherwise a multi-hour do-over, and the pip wheel
@@ -194,7 +197,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "openhands-tools==${AGENT_SERVER_VERSION}" \
         "openhands-workspace==${AGENT_SERVER_VERSION}" \
         "openhands-automation==${AUTOMATION_VERSION}" \
-        "agent-client-protocol<0.11" \
         > /opt/build/requirements.txt && \
     pip install -r /opt/build/requirements.txt
 
