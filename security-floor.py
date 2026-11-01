@@ -6,6 +6,13 @@ fixed vulnerability: the venv is audited with pip-audit, and every vulnerable
 distribution is lifted to the release that fixes it — a wheel from RISE if one
 exists, compiled from the sdist otherwise.
 
+A fix for one package can pull another one back into a vulnerable range (a
+newer release of A capping B below the release that fixes B). Compiling A is
+the expensive part of the build, so before anything is installed the plan is
+resolved with pip's --dry-run and the resulting set audited too; whatever it
+would itself leave vulnerable joins the requirements, and pip settles on a
+release of A that fits.
+
 It fails closed: if the audit cannot run, or an installable fix does not end
 up installed, the build stops. The one case it lets through, loudly, is a fix
 that does not fit alongside the rest of the stack; a plain PyPI build could
@@ -23,6 +30,9 @@ import sys
 import tempfile
 
 from packaging.version import InvalidVersion, Version
+
+# How many times the plan may grow before it is taken as it stands.
+PLAN_ROUNDS = 5
 
 TARGET = os.environ["VIRTUAL_ENV"]
 REQUIREMENTS = "/opt/build/requirements.txt"
@@ -44,7 +54,7 @@ def parse_version(text, what):
         fail(f"cannot parse version {text!r} of {what}")
 
 
-def audit():
+def run_audit(args):
     """Vulnerable distributions as {name: (installed, [(vuln id, [newer fixes])])}.
 
     pip-audit's JSON output is {"dependencies": [...], "fixes": [...]}, always
@@ -58,15 +68,10 @@ def audit():
     status was — which is otherwise ambiguous between "vulnerabilities found"
     and "failed" (both are exit status 1).
     """
-    site_packages = subprocess.run(
-        [os.path.join(TARGET, "bin", "python"), "-c",
-         "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
     with tempfile.TemporaryDirectory() as tmp:
         report = os.path.join(tmp, "audit.json")
         status = subprocess.run([
-            PIP_AUDIT, "--path", site_packages, "--strict",
+            PIP_AUDIT, *args, "--strict",
             "--progress-spinner", "off", "--format", "json", "--output", report,
         ]).returncode
         try:
@@ -87,6 +92,25 @@ def audit():
     return found
 
 
+def audit():
+    """Audit of what is installed in the venv."""
+    site_packages = subprocess.run(
+        [os.path.join(TARGET, "bin", "python"), "-c",
+         "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return run_audit(["--path", site_packages])
+
+
+def audit_pins(pins):
+    """Audit of {name: version} that is not installed (--disable-pip: nothing is resolved)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "pins.txt")
+        with open(path, "w") as f:
+            f.writelines(f"{name}=={version}\n" for name, version in sorted(pins.items()))
+        return run_audit(["-r", path, "--no-deps", "--disable-pip"])
+
+
 def floors(found):
     """{name: lowest release that fixes every fixable vulnerability of it}."""
     result = {}
@@ -98,6 +122,56 @@ def floors(found):
             else:
                 log(f"WARNING: {name} {installed}: {vuln_id}, no fixed release yet")
     return result
+
+
+def resolve(specs):
+    """{name: version} the venv would hold after installing specs, or None.
+
+    --dry-run resolves exactly like the real install (for an sdist it prepares
+    the metadata and goes no further, so nothing is compiled) and installs
+    nothing. Its report lists only what would change, hence the merge with what
+    is installed now. None means pip found no solution, which install_floors
+    deals with.
+    """
+    pip = os.path.join(TARGET, "bin", "pip")
+    pins = {d["name"]: d["version"] for d in json.loads(subprocess.run(
+        [pip, "list", "--format", "json"], check=True, capture_output=True, text=True,
+    ).stdout)}
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "plan.json")
+        status = subprocess.run(
+            [pip, "install", "--dry-run", "--quiet", "--report", report,
+             "-r", REQUIREMENTS, *specs]
+        ).returncode
+        if status != 0:
+            return None
+        with open(report) as f:
+            for item in json.load(f)["install"]:
+                meta = item["metadata"]
+                pins[meta["name"]] = meta["version"]
+    return pins
+
+
+def plan(wanted):
+    """Grow {name: spec} by the fixes that the resolved result would still need.
+
+    Stops when the plan audits clean, at PLAN_ROUNDS, or when pip cannot
+    resolve it at all; in the last two cases the plan is returned as it
+    stands and the real install and the final audit have the last word.
+    """
+    for _ in range(PLAN_ROUNDS):
+        pins = resolve(list(wanted.values()))
+        if pins is None:
+            log("WARNING: the fixes cannot be resolved together; trying them one by one")
+            return wanted
+        grown = {name: f"{name}>={version}"
+                 for name, version in floors(audit_pins(pins)).items()}
+        grown = {name: spec for name, spec in grown.items() if wanted.get(name) != spec}
+        if not grown:
+            return wanted
+        log("the plan needs more: " + " ".join(sorted(grown.values())))
+        wanted = {**wanted, **grown}
+    return wanted
 
 
 def try_install(specs):
@@ -143,6 +217,7 @@ def main():
         log("no known vulnerabilities with a released fix")
         return
 
+    wanted = plan(wanted)
     fixed = install_floors(wanted)
     blocked = {name: spec for name, spec in wanted.items() if name not in fixed}
     if fixed:
