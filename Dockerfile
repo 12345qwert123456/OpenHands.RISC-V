@@ -146,13 +146,26 @@ RUN python3 -m venv ${VIRTUAL_ENV} && \
 # Debian's security updates never reach and pip-audit cannot see. Both are
 # quick to build.
 #
+# PIP_ONLY_BINARY is the opposite exception, for grpcio: never compile it. PIP_PREFER_BINARY
+# is not enough there. RISE trails PyPI (grpcio 1.78.0 against 1.85.1 in
+# November 2026), and grpcio-status, a pure-Python wheel that PyPI does have
+# in its newest release, pins grpcio to the same version (grpcio-status 1.85.1
+# requires grpcio>=1.85.1). pip first picks the RISE wheel, then hits that
+# pin, backtracks and settles on the grpcio sdist: a 4 h compile under QEMU
+# that on its own leaves no room for the rest of the build in the 6 h limit.
+# With sdists ruled out for grpcio, the resolver backtracks the other way and
+# takes the grpcio-status that matches the RISE wheel instead. If RISE ever
+# loses its grpcio wheel altogether, the build now fails fast on resolution
+# instead of timing out hours later.
+#
 # These are pip's own environment variable names: an ARG is visible to RUN as
 # an environment variable, so pip reads them directly. For a build entirely
 # from PyPI sources, as before:
-#   --build-arg PIP_EXTRA_INDEX_URL= --build-arg PIP_PREFER_BINARY=0
+#   --build-arg PIP_EXTRA_INDEX_URL= --build-arg PIP_PREFER_BINARY=0 --build-arg PIP_ONLY_BINARY=
 ARG PIP_EXTRA_INDEX_URL=https://gitlab.com/api/v4/projects/56254198/packages/pypi/simple
 ARG PIP_PREFER_BINARY=1
 ARG PIP_NO_BINARY=cryptography,pillow
+ARG PIP_ONLY_BINARY=grpcio
 
 # Compiler settings for whatever is still built from source. -g0: Debian's
 # Python compiles extensions with -g, which made a from-source grpcio wheel
